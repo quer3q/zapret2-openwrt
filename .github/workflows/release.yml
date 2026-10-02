@@ -1,0 +1,235 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  # Manual: release a newer upstream version, else main's current version if its tag is new.
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  # OpenWrt package arches; each needs a row in build.sh's case.
+  ARCHES: aarch64_generic x86_64
+  # The OpenWrt release whose stock rootfs installs the packages as a smoke test.
+  OPENWRT: 25.12.5
+  ALPINE: alpine:3.24
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      ref: ${{ steps.check.outputs.ref }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check the tag or upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file=build.sh
+          pkg_version=$(sed -n 's/^PKG_VERSION=//p' "$file")
+          pkg_release=$(sed -n 's/^PKG_RELEASE=//p' "$file")
+          [[ "$pkg_version" =~ ^[0-9]+(\.[0-9]+)*$ && "$pkg_release" =~ ^[1-9][0-9]*$ ]]
+          version="$pkg_version-r$pkg_release"
+          ref=$(git rev-parse HEAD)
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "::error::tag must be v$version"; exit 1; }
+            ref="$GITHUB_REF_NAME"
+            publish=true
+          else
+            # Update main only. The atomic push below stops two runs from both bumping it; no
+            # workflow concurrency group (it would cancel queued tag releases).
+            git fetch --depth=1 origin main
+            if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+              [ "$GITHUB_REF" = refs/heads/main ] && [ "$ref" = "$(git rev-parse FETCH_HEAD)" ] \
+                || { echo "::error::manual runs release from the head of main only"; exit 1; }
+            fi
+            # An existing tag is never rebuilt or overwritten. (An API error reads as "absent";
+            # the non-force push then fails instead.)
+            tag_exists() { gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$1" >/dev/null 2>&1; }
+            release=$(gh api repos/bol-van/zapret2/releases/latest)
+            upstream_tag=$(jq -er '.tag_name' <<< "$release")
+            [[ "$upstream_tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]
+            upstream=${upstream_tag#v}
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            main_version=$(git show FETCH_HEAD:"$file" | sed -n 's/^PKG_VERSION=//p')
+            [[ "$main_version" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+            if [ "$upstream" != "$main_version" ] && [ "$(printf '%s\n' "$main_version" "$upstream" | sort -V | tail -n1)" = "$upstream" ]; then
+              if tag_exists "v$upstream-r1"; then
+                echo "::warning::v$upstream-r1 already exists but main pins $main_version: nothing to release"
+                printf 'version=%s\nref=%s\npublish=false\n' "$version" "$ref" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              asset="zapret2-$upstream_tag-openwrt-embedded.tar.gz"
+              digest=$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .digest' <<< "$release")
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              hash=${digest#sha256:}
+              archive="$RUNNER_TEMP/$asset"
+              curl -sSfL --retry 5 -o "$archive" "https://github.com/bol-van/zapret2/releases/download/$upstream_tag/$asset"
+              printf '%s  %s\n' "$hash" "$archive" | sha256sum -c -
+              git checkout -B main FETCH_HEAD
+              sed -i -e "s/^PKG_VERSION=.*/PKG_VERSION=$upstream/" \
+                -e "s/^PKG_HASH=.*/PKG_HASH=$hash/" -e 's/^PKG_RELEASE=.*/PKG_RELEASE=1/' "$file"
+              git add "$file"
+              git commit -m "zapret2 $upstream"
+              version="$upstream-r1"
+              ref="v$version"
+              git tag -a "$ref" -m "zapret2 $version"
+              git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+                push --atomic origin HEAD:refs/heads/main "refs/tags/$ref"
+              publish=true
+            elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+              # A manual release tags main's current version (first release, PKG_RELEASE bump).
+              if tag_exists "v$version"; then
+                echo "::notice::v$version already exists: nothing to release (bump PKG_RELEASE in build.sh for a new one)"
+              else
+                ref="v$version"
+                git tag -a "$ref" -m "zapret2 $version"
+                git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+                  push origin "refs/tags/$ref"
+                publish=true
+              fi
+            fi
+          fi
+          printf 'version=%s\nref=%s\npublish=%s\n' "$version" "$ref" "$publish" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+          persist-credentials: false
+      # Signing secrets reach only the check and sign steps, never the package build.
+      - name: Check the apk signing secrets
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          APK_PUBLIC_KEY: ${{ secrets.APK_PUBLIC_KEY }}
+        run: |
+          if [ -z "$APK_SIGNING_KEY" ] || [ -z "$APK_PUBLIC_KEY" ]; then
+            echo "::error::set APK_SIGNING_KEY and APK_PUBLIC_KEY (see README, Maintainers)"
+            exit 1
+          fi
+          signing=$(printf '%s\n' "$APK_SIGNING_KEY" | openssl pkey -pubout) && [ -n "$signing" ] \
+            || { echo "::error::APK_SIGNING_KEY is not an unencrypted private key PEM"; exit 1; }
+          public=$(printf '%s\n' "$APK_PUBLIC_KEY" | openssl pkey -pubin -pubout) && [ -n "$public" ] \
+            || { echo "::error::APK_PUBLIC_KEY is not a public key PEM"; exit 1; }
+          [ "$signing" = "$public" ] || { echo "::error::APK_PUBLIC_KEY does not match APK_SIGNING_KEY"; exit 1; }
+      # Nothing is compiled: build.sh repacks upstream's prebuilt static nfqws2 with apk-tools 3.
+      - name: Build the packages
+        run: |
+          for arch in $ARCHES; do
+            docker run --rm -v "$PWD:/w" -w /w "$ALPINE" sh build.sh "$arch" dist
+            [ -f "dist/zapret2-$VERSION-$arch.apk" ] || { echo "::error::expected dist/zapret2-$VERSION-$arch.apk"; exit 1; }
+          done
+          [ "$(ls dist | wc -l)" = "$(echo $ARCHES | wc -w)" ] || { echo "::error::unexpected files in dist"; ls dist; exit 1; }
+      # Release assets are flat, so each arch gets its own index. The published one names
+      # this release's .apk by absolute URL: a router holding a cached index still fetches
+      # it after a newer release takes over releases/latest. test-<arch>.adb is the same
+      # index with relative names, for the install test below; it isn't published.
+      - name: Sign and verify the package indexes
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          APK_PUBLIC_KEY: ${{ secrets.APK_PUBLIC_KEY }}
+        run: |
+          docker run --rm -e APK_SIGNING_KEY -e APK_PUBLIC_KEY -e ARCHES -e VERSION -e GITHUB_REPOSITORY -v "$PWD/dist:/dist" -w /dist "$ALPINE" sh -euc '
+            (umask 077 && printf "%s\n" "$APK_SIGNING_KEY" > /tmp/key.pem)
+            mkdir /tmp/keys
+            printf "%s\n" "$APK_PUBLIC_KEY" > /tmp/keys/zapret2.pem
+            spec="\${name}-\${version}-\${arch}.apk"
+            url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+            for arch in $ARCHES; do
+              apk mkndx --allow-untrusted --sign-key /tmp/key.pem --pkgname-spec "$url/$spec" \
+                --output "packages-$arch.adb" zapret2-*-"$arch".apk
+              apk mkndx --allow-untrusted --sign-key /tmp/key.pem --pkgname-spec "$spec" \
+                --output "test-$arch.adb" zapret2-*-"$arch".apk
+              apk verify --keys-dir /tmp/keys "packages-$arch.adb" "test-$arch.adb"
+            done
+            cp /tmp/keys/zapret2.pem .
+          '
+      - uses: docker/setup-qemu-action@v3
+      # A stock OpenWrt rootfs per arch: install from the signed index with only the published
+      # key, then run nfqws2. The container can't load nftables.
+      - name: Install on OpenWrt
+        run: |
+          for arch in $ARCHES; do
+            docker run --rm -e arch="$arch" -v "$PWD/dist:/dist:ro" "openwrt/rootfs:$arch-v$OPENWRT" sh -euc '
+              mkdir -p /var/lock
+              cp /dist/zapret2.pem /etc/apk/keys/
+              echo "/dist/test-$(cat /etc/apk/arch).adb" > /etc/apk/repositories.d/customfeeds.list
+              apk update
+              apk add zapret2
+              /opt/zapret2/nfq2/nfqws2 --version
+              grep -q "procd_set_param respawn" /etc/init.d/zapret2
+              ls /etc/rc.d/S*zapret2
+            '
+          done
+          sudo rm -f dist/test-*.adb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build]
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    # Serializes the Latest check with the release it creates.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist
+      - name: Checksums and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          for f in zapret2.pem $(for a in $ARCHES; do echo "zapret2-$VERSION-$a.apk packages-$a.adb"; done); do
+            [ -f "dist/$f" ] || { echo "::error::dist/$f missing"; exit 1; }
+          done
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          fp=$(sha256sum < dist/zapret2.pem | cut -d' ' -f1)
+          {
+            echo "OpenWrt package and signed apk feed. See README.md for installation."
+            echo
+            echo "zapret2.pem SHA-256 (file bytes): $fp"
+            echo
+            echo "Upstream: https://github.com/bol-van/zapret2/releases/tag/v${VERSION%-r*}"
+          } > notes.md
+          # Latest is the feed: a re-run of an older failed release must not take it back.
+          if ! latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2> err); then
+            grep -q 'HTTP 404' err || { cat err; exit 1; }
+            latest=
+          fi
+          make_latest=true
+          if [ -n "$latest" ] && [ "$(printf '%s\n' "${latest#v}" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
+            echo "::warning::$latest is newer and stays Latest"
+            make_latest=false
+          fi
+          gh release create "v$VERSION" dist/* --verify-tag --latest="$make_latest" \
+            --title "zapret2 v$VERSION" --notes-file notes.md
