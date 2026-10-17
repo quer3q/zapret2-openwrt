@@ -9,7 +9,7 @@
 set -eu
 
 PKG_VERSION=1.0.5.2
-PKG_RELEASE=1
+PKG_RELEASE=2
 PKG_HASH=9a2b08ec8c4b40f908e55684ea29d40b2316a1f2eebb08ea6afcb1e5c9c0fc89
 
 arch=$1
@@ -35,29 +35,29 @@ s=$work/zapret2-v$PKG_VERSION
 r=$work/root
 o=$r/opt/zapret2
 
-# The init script finds /opt/zapret2 by resolving the /etc/init.d/zapret2 symlink.
+# The init and hotplug scripts are real files, not symlinks into /opt: the ImageBuilder enables
+# services by running /etc/init.d/* from its rootfs, where an absolute symlink points at the
+# build host. Not being symlinks, they use their built-in ZAPRET_BASE=/opt/zapret2.
 mkdir -p "$o/init.d/openwrt" "$o/nfq2" "$o/mdig" "$o/ip2net" "$o/files" "$r/etc/zapret2/custom.d" \
 	"$r/etc/init.d" "$r/etc/hotplug.d/iface" "$r/lib/upgrade/keep.d" "$r/lib/apk/packages"
 cp -R "$s/common" "$s/ipset" "$s/lua" "$s/config.default" "$work/LICENSE.txt" "$o/"
 # Fake-packet blobs for --blob=...@/opt/zapret2/files/fake/*.bin strategies.
 cp -R "$s/files/fake" "$o/files/"
-for f in zapret2 90-zapret2 functions firewall.zapret2; do
-	cp "$s/init.d/openwrt/$f" "$o/init.d/openwrt/"
-done
+cp "$s/init.d/openwrt/functions" "$s/init.d/openwrt/firewall.zapret2" "$o/init.d/openwrt/"
+cp "$s/init.d/openwrt/zapret2" "$r/etc/init.d/zapret2"
+cp "$s/init.d/openwrt/90-zapret2" "$r/etc/hotplug.d/iface/90-zapret2"
 cp "$s/binaries/$bin/nfqws2" "$o/nfq2/"
 # ipset/def.sh runs these to resolve hostlists and collapse IP ranges.
 cp "$s/binaries/$bin/mdig" "$o/mdig/"
 cp "$s/binaries/$bin/ip2net" "$o/ip2net/"
-chmod 755 "$o/nfq2/nfqws2" "$o/mdig/mdig" "$o/ip2net/ip2net" "$o/init.d/openwrt/zapret2" "$o/init.d/openwrt/90-zapret2"
+chmod 755 "$o/nfq2/nfqws2" "$o/mdig/mdig" "$o/ip2net/ip2net" "$r/etc/init.d/zapret2" "$r/etc/hotplug.d/iface/90-zapret2"
 ln -s /etc/zapret2/config "$o/config"
 ln -s /etc/zapret2/custom.d "$o/init.d/openwrt/custom.d"
 cp "$s/config.default" "$r/etc/zapret2/config"
-ln -s /opt/zapret2/init.d/openwrt/zapret2 "$r/etc/init.d/zapret2"
-ln -s /opt/zapret2/init.d/openwrt/90-zapret2 "$r/etc/hotplug.d/iface/90-zapret2"
 echo /etc/zapret2/ > "$r/lib/upgrade/keep.d/zapret2"
 
 # Upstream's run_daemon() starts nfqws2 without procd respawn: add it after the command.
-init=$o/init.d/openwrt/zapret2
+init=$r/etc/init.d/zapret2
 sed -i 's/^\([[:space:]]*\)procd_set_param command .*/&\n\1procd_set_param respawn/' "$init"
 [ "$(grep -c 'procd_set_param respawn' "$init")" = 1 ] ||
 	{ echo "zapret2: respawn patch did not apply once: upstream init.d/openwrt/zapret2 changed" >&2; exit 1; }

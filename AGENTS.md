@@ -4,7 +4,7 @@ Signed OpenWrt apk feed for upstream zapret2. README.md has install and maintain
 
 ## Layout
 
-- `build.sh`: the whole package. It downloads the pinned upstream `openwrt-embedded` tarball, checks `PKG_HASH`, stages `/opt/zapret2` + `/etc` symlinks, patches procd `respawn` into the init, writes OpenWrt's `lib/apk/packages/zapret2.{list,conffiles,conffiles_static}` and lifecycle scripts (as the SDK's `include/package-pack.mk` does), then runs `apk mkpkg`.
+- `build.sh`: the whole package. It downloads the pinned upstream `openwrt-embedded` tarball, checks `PKG_HASH`, stages `/opt/zapret2`, the init + hotplug scripts as real files in `/etc` (an absolute symlink breaks ImageBuilder service enabling), patches procd `respawn` into the init, writes OpenWrt's `lib/apk/packages/zapret2.{list,conffiles,conffiles_static}` and lifecycle scripts (as the SDK's `include/package-pack.mk` does), then runs `apk mkpkg`.
 - `.github/workflows/release.yml`: `check` (daily upstream check, bumps `PKG_VERSION`/`PKG_HASH` in build.sh, pushes main + tag; a manual run with no upstream update tags main's current version; an existing tag means do nothing, never overwrite) → `build` (build.sh per arch in Alpine, signs `packages-<arch>.adb`, installs on stock `openwrt/rootfs`) → `publish` (GitHub release, Latest).
 
 ## Rules
