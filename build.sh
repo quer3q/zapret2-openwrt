@@ -8,9 +8,9 @@
 #   docker run --rm -v "$PWD:/w" -w /w alpine:3.24 sh build.sh aarch64_generic dist
 set -eu
 
-PKG_VERSION=1.0.5.2
-PKG_RELEASE=2
-PKG_HASH=9a2b08ec8c4b40f908e55684ea29d40b2316a1f2eebb08ea6afcb1e5c9c0fc89
+PKG_VERSION=1.0.6
+PKG_RELEASE=1
+PKG_HASH=51bed396f3737ed6358006772cd50fe97a405ec9bb8886426cb004b1dd094ede
 
 arch=$1
 out=$2
