@@ -6,7 +6,7 @@ Signed OpenWrt apk feed for [zapret2](https://github.com/bol-van/zapret2): `apk 
 - **Minimal deps:** only `kmod-nft-queue`.
 - **procd respawn** instead of a watchdog; upgrades restart the service.
 - **Auto-updated:** CI checks upstream daily and publishes a release when it changes.
-- OpenWrt 25.12+ (apk), **aarch64_generic** and **x86_64**.
+- OpenWrt 25.12+ (apk), **aarch64_generic**, **aarch64_cortex-a53** (including Banana Pi R3), and **x86_64**.
 
 ## Install
 

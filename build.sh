@@ -24,10 +24,16 @@ esac
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-wget -qO "$work/src.tar.gz" \
-	"https://github.com/bol-van/zapret2/releases/download/v$PKG_VERSION/zapret2-v$PKG_VERSION-openwrt-embedded.tar.gz"
-echo "$PKG_HASH  $work/src.tar.gz" | sha256sum -c -
-tar -xzf "$work/src.tar.gz" -C "$work"
+archive=${ZAPRET2_ARCHIVE:-"$work/src.tar.gz"}
+if [ ! -f "$archive" ]; then
+	wget -qO "$work/download.tar.gz" \
+		"https://github.com/bol-van/zapret2/releases/download/v$PKG_VERSION/zapret2-v$PKG_VERSION-openwrt-embedded.tar.gz"
+	echo "$PKG_HASH  $work/download.tar.gz" | sha256sum -c -
+	mv "$work/download.tar.gz" "$archive"
+else
+	echo "$PKG_HASH  $archive" | sha256sum -c -
+fi
+tar -xzf "$archive" -C "$work"
 # The embedded tarball has no license; MIT requires shipping the notice.
 wget -qO "$work/LICENSE.txt" "https://raw.githubusercontent.com/bol-van/zapret2/v$PKG_VERSION/docs/LICENSE.txt"
 grep -q 'Permission is hereby granted' "$work/LICENSE.txt"

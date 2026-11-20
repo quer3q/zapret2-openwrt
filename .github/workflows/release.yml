@@ -13,9 +13,10 @@ permissions:
 
 env:
   # OpenWrt package arches; each needs a row in build.sh's case.
-  ARCHES: aarch64_generic x86_64
+  ARCHES: aarch64_generic aarch64_cortex-a53 x86_64
   # The OpenWrt release whose stock rootfs installs the packages as a smoke test.
-  OPENWRT: 25.12.5
+  OPENWRT: 25.12.6
+  FILOGIC_KERNEL_ABI: 6.12.112-1-f0a7348f9cb959e1bf4d0447669b031e
   ALPINE: alpine:3.24
 
 jobs:
@@ -135,11 +136,22 @@ jobs:
       # Nothing is compiled: build.sh repacks upstream's prebuilt static nfqws2 with apk-tools 3.
       - name: Build the packages
         run: |
+          docker run --rm -e ARCHES -v "$PWD:/w" -w /w "$ALPINE" sh -euc '
+            export ZAPRET2_ARCHIVE=/tmp/zapret2-openwrt-embedded.tar.gz
+            for arch in $ARCHES; do
+              sh build.sh "$arch" dist
+            done
+            # Use the same packaging hooks in a lower-version upgrade fixture.
+            sed "s/version:\$PKG_VERSION-r\$PKG_RELEASE/version:0-r1/" build.sh > /tmp/build-fixture.sh
+            for arch in $ARCHES; do
+              sh /tmp/build-fixture.sh "$arch" dist/fixture
+              mv dist/fixture/zapret2-*-"$arch".apk "dist/fixture/zapret2-0-r1-$arch.apk"
+            done
+          '
           for arch in $ARCHES; do
-            docker run --rm -v "$PWD:/w" -w /w "$ALPINE" sh build.sh "$arch" dist
             [ -f "dist/zapret2-$VERSION-$arch.apk" ] || { echo "::error::expected dist/zapret2-$VERSION-$arch.apk"; exit 1; }
           done
-          [ "$(ls dist | wc -l)" = "$(echo $ARCHES | wc -w)" ] || { echo "::error::unexpected files in dist"; ls dist; exit 1; }
+          [ "$(find dist -maxdepth 1 -name '*.apk' | wc -l)" = "$(echo $ARCHES | wc -w)" ] || { echo "::error::unexpected files in dist"; ls dist; exit 1; }
       # Release assets are flat, so each arch gets its own index. The published one names
       # this release's .apk by absolute URL: a router holding a cached index still fetches
       # it after a newer release takes over releases/latest. test-<arch>.adb is the same
@@ -160,6 +172,8 @@ jobs:
                 --output "packages-$arch.adb" zapret2-*-"$arch".apk
               apk mkndx --allow-untrusted --sign-key /tmp/key.pem --pkgname-spec "$spec" \
                 --output "test-$arch.adb" zapret2-*-"$arch".apk
+              apk mkndx --allow-untrusted --sign-key /tmp/key.pem --pkgname-spec "$spec" \
+                --output "fixture/old-$arch.adb" "fixture/zapret2-0-r1-$arch.apk"
               apk verify --keys-dir /tmp/keys "packages-$arch.adb" "test-$arch.adb"
             done
             cp /tmp/keys/zapret2.pem .
@@ -169,19 +183,9 @@ jobs:
       # key, then run nfqws2. The container can't load nftables.
       - name: Install on OpenWrt
         run: |
-          for arch in $ARCHES; do
-            docker run --rm -e arch="$arch" -v "$PWD/dist:/dist:ro" "openwrt/rootfs:$arch-v$OPENWRT" sh -euc '
-              mkdir -p /var/lock
-              cp /dist/zapret2.pem /etc/apk/keys/
-              echo "/dist/test-$(cat /etc/apk/arch).adb" > /etc/apk/repositories.d/customfeeds.list
-              apk update
-              apk add zapret2
-              /opt/zapret2/nfq2/nfqws2 --version
-              grep -q "procd_set_param respawn" /etc/init.d/zapret2
-              ls /etc/rc.d/S*zapret2
-            '
-          done
-          sudo rm -f dist/test-*.adb
+          sh tests/feed.sh local "$VERSION"
+          sudo rm -f dist/test-*.adb dist/fixture/*.adb dist/fixture/*.apk
+          sudo rmdir dist/fixture
       - uses: actions/upload-artifact@v7
         with:
           name: packages
@@ -199,6 +203,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: packages
@@ -233,3 +241,13 @@ jobs:
           fi
           gh release create "v$VERSION" dist/* --verify-tag --latest="$make_latest" \
             --title "zapret2 v$VERSION" --notes-file notes.md
+          echo "VERIFY_LATEST=$make_latest" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v3
+      - name: Install from published feed
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          release="https://github.com/$GITHUB_REPOSITORY/releases"
+          url="$release/download/v$VERSION"
+          if [ "$VERIFY_LATEST" = true ]; then url="$release/latest/download"; fi
+          sh tests/feed.sh "$url" "$VERSION"
